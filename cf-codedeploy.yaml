@@ -1,0 +1,267 @@
+Parameters:
+  InstanceTypeParameter:
+    Type: String
+    Default: t3.micro
+    Description: Enter instance size. Default is t3.micro.
+  AMI:
+    Type: AWS::EC2::Image::Id
+    Default: ami-08d4ac5b634553e16
+    Description: The linux AMI to use.
+  Key:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: The key used to access the instance.
+  SSHIP:
+    Type: String
+    Description: IP for remote SSH.
+  S3BucketName:
+    Type: String
+    Description: S3 Bucket name for source code.
+  CodeDeployName:
+    Type: String
+    Description: Codedeploy Application and Deployment Group name.
+  ASGCapacity:
+    Type: List<Number>
+    Description: Min, Desired & Max capacity of Autoscaling Group seperated with comma.
+  HealthCheckPath:
+    Type: String
+    Description: Health check path for ALB.
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      InstanceTenancy: default
+      Tags:
+        - Key: Name
+          Value: CodeDeploy VPC
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.0.0/24
+      MapPublicIpOnLaunch: true
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+  InternetRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGateway
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+      RouteTableId: !Ref RouteTable
+  SubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTable
+      SubnetId: !Ref SubnetA
+  SubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTable
+      SubnetId: !Ref SubnetB
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: "ALB Security Group"
+      GroupDescription: "ALB Security Group"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+       - IpProtocol: tcp
+         FromPort: '80'
+         ToPort: '80'
+         CidrIp: '0.0.0.0/0'
+       - IpProtocol: tcp
+         FromPort: '443'
+         ToPort: '443'
+         CidrIp: '0.0.0.0/0'
+      SecurityGroupEgress:
+       - IpProtocol: -1
+         CidrIp: 0.0.0.0/0
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: "EC2 Security Group"
+      GroupDescription: "EC2 Security Group"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+       - IpProtocol: tcp
+         FromPort: '80'
+         ToPort: '80'
+         SourceSecurityGroupId: !GetAtt ALBSecurityGroup.GroupId
+       - IpProtocol: tcp
+         FromPort: '22'
+         ToPort: '22'
+         CidrIp: !Sub ${SSHIP}/32
+      SecurityGroupEgress:
+       - IpProtocol: -1
+         CidrIp: 0.0.0.0/0
+
+  s3Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+      RoleName: EC2S3Access
+
+  cdRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codedeploy.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole
+      Policies:
+        - PolicyName: codedeploy-for-launch-template
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                  - ec2:CreateTags
+                  - ec2:RunInstances
+                Resource: '*'
+      RoleName: CodeDeployRole
+
+
+  ServerProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      InstanceProfileName: cdInstanceProfile
+      Roles:
+        - !Ref s3Role
+
+  ServerLaunchTemplate:
+    Type: 'AWS::EC2::LaunchTemplate'
+    Properties:
+      LaunchTemplateName: CodeDeployASGLaunchTemplate
+      LaunchTemplateData:
+        InstanceType: !Ref InstanceTypeParameter
+        SecurityGroupIds:
+          - !Ref InstanceSecurityGroup
+        IamInstanceProfile:
+          Name: !Ref ServerProfile
+        ImageId: !Ref AMI
+        KeyName: !Ref Key
+        UserData:
+           Fn::Base64:
+            !Sub |
+              #!/bin/bash
+              sudo apt-get update -y
+              sudo apt-get install ruby-full wget -y
+              cd /home/ubuntu
+              wget https://aws-codedeploy-${AWS::Region}.s3.${AWS::Region}.amazonaws.com/latest/install
+              chmod +x ./install
+              sudo ./install auto > /tmp/logfile
+              sudo service codedeploy-agent start
+
+  cdASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: CodeDeployASG
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ServerLaunchTemplate
+        Version: !GetAtt ServerLaunchTemplate.LatestVersionNumber
+      MaxSize: !Select [ 2, !Ref ASGCapacity ]
+      MinSize: !Select [ 0, !Ref ASGCapacity ]
+      DesiredCapacity: !Select [ 1, !Ref ASGCapacity ]
+      TargetGroupARNs:
+        - !Ref cdTargetGroup
+      VPCZoneIdentifier:
+        - !Ref SubnetA
+        - !Ref SubnetB
+
+  cdTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckPath: !Ref HealthCheckPath
+      HealthCheckProtocol: HTTP
+      Name: CodeDeployTargetGroup
+      Port: 80
+      Protocol: HTTP
+      TargetType: "instance"
+      Matcher:
+        HttpCode: "200"
+      VpcId: !Ref VPC
+
+  cdALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: cdtest
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Subnets:
+        - !Ref SubnetA
+        - !Ref SubnetB
+
+  HTTPListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref cdALB
+      Port: 80
+      Protocol: "HTTP"
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref cdTargetGroup
+
+
+  cdS3:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3BucketName
+
+  cdApp:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Ref CodeDeployName
+      ComputePlatform: Server
+
+  cdDG:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref cdApp
+      AutoScalingGroups:
+        - !Ref cdASG
+      DeploymentGroupName: !Ref CodeDeployName
+      AutoRollbackConfiguration:
+        Enabled: true
+        Events:
+          - DEPLOYMENT_FAILURE
+          - DEPLOYMENT_STOP_ON_REQUEST
+      ServiceRoleArn: !GetAtt cdRole.Arn
